@@ -69,9 +69,9 @@ def load_step_triangles(path):
     else:
         mesh = loaded
 
-    # cascadio writes GLB vertices in the original STEP coordinates (no
-    # glTF Y-up conversion), so the triangles can be used as-is.
-    triangles = np.asarray(mesh.triangles, dtype=np.float64)
+    # cascadio keeps the STEP axes (no glTF Y-up conversion) but converts
+    # units to meters; scale back to millimetres, the STEP working unit.
+    triangles = np.asarray(mesh.triangles, dtype=np.float64) * 1000.0
     if triangles.size == 0:
         raise ValueError("No geometry found in file.")
     return triangles
@@ -238,6 +238,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("STEP Scaler")
         self.setAcceptDrops(True)
         self._loaded_path = None
+        self._extents = None
 
         self.preview = PreviewWidget()
 
@@ -246,26 +247,45 @@ class MainWindow(QMainWindow):
 
         validator = QDoubleValidator(1e-9, 1e9, 6, self)
         validator.setNotation(QDoubleValidator.StandardNotation)
-        self.scale_edits = {}
+
+        def make_axis_edits(row):
+            edits = {}
+            for axis in ("X", "Y", "Z"):
+                row.addWidget(QLabel(f"{axis}:"))
+                edit = QLineEdit()
+                edit.setValidator(validator)
+                edit.setFixedWidth(70)
+                edit.setEnabled(False)
+                edits[axis] = edit
+                row.addWidget(edit)
+            return edits
+
+        # Row 1: absolute target dimensions, prefilled with the model size.
+        size_row = QHBoxLayout()
+        size_row.addStretch()
+        size_row.addWidget(QLabel("Size (mm):"))
+        self.size_edits = make_axis_edits(size_row)
+        self.size_scale_button = QPushButton("Scale to size")
+        self.size_scale_button.setFixedWidth(110)
+        self.size_scale_button.setEnabled(False)
+        self.size_scale_button.clicked.connect(self._on_scale_to_size_clicked)
+        size_row.addWidget(self.size_scale_button)
+
+        # Row 2: relative scale factors.
         scale_row = QHBoxLayout()
         scale_row.addWidget(self.load_button)
         scale_row.addStretch()
-        for axis in ("X", "Y", "Z"):
-            scale_row.addWidget(QLabel(f"{axis}:"))
-            edit = QLineEdit()
-            edit.setValidator(validator)
-            edit.setFixedWidth(70)
-            edit.setEnabled(False)
-            self.scale_edits[axis] = edit
-            scale_row.addWidget(edit)
-
+        scale_row.addWidget(QLabel("Factor:"))
+        self.scale_edits = make_axis_edits(scale_row)
         self.scale_button = QPushButton("Scale")
+        self.scale_button.setFixedWidth(110)
         self.scale_button.setEnabled(False)
         self.scale_button.clicked.connect(self._on_scale_clicked)
         scale_row.addWidget(self.scale_button)
 
         layout = QVBoxLayout()
         layout.addWidget(self.preview, stretch=1)
+        layout.addLayout(size_row)
         layout.addLayout(scale_row)
         central = QWidget()
         central.setLayout(layout)
@@ -315,29 +335,55 @@ class MainWindow(QMainWindow):
 
         self._loaded_path = Path(path)
         self.preview.set_triangles(triangles)
+        points = triangles.reshape(-1, 3)
+        self._extents = points.max(axis=0) - points.min(axis=0)
         for edit in self.scale_edits.values():
             edit.setEnabled(True)
             edit.setText("1")
+        for extent, edit in zip(self._extents, self.size_edits.values()):
+            edit.setEnabled(True)
+            edit.setText(f"{extent:.6g}")
         self.scale_button.setEnabled(True)
+        self.size_scale_button.setEnabled(True)
         self.statusBar().showMessage(
             f"Loaded {self._loaded_path.name} "
             f"({len(triangles):,} triangles).")
 
     # ---- scaling -------------------------------------------------------
 
-    def _on_scale_clicked(self):
-        factors = {}
-        for axis, edit in self.scale_edits.items():
+    def _read_positive_values(self, edits, what):
+        values = {}
+        for axis, edit in edits.items():
             try:
                 value = float(edit.text().replace(",", "."))
             except ValueError:
                 value = 0.0
             if value <= 0.0:
-                QMessageBox.warning(self, "Invalid scale",
-                                    f"{axis} scale must be a positive number.")
-                return
-            factors[axis] = value
+                QMessageBox.warning(self, f"Invalid {what}",
+                                    f"{axis} {what} must be a positive number.")
+                return None
+            values[axis] = value
+        return values
 
+    def _on_scale_clicked(self):
+        factors = self._read_positive_values(self.scale_edits, "scale")
+        if factors is not None:
+            self._export_scaled(factors)
+
+    def _on_scale_to_size_clicked(self):
+        targets = self._read_positive_values(self.size_edits, "size")
+        if targets is None:
+            return
+        factors = {}
+        for axis, extent in zip(("X", "Y", "Z"), self._extents):
+            if extent <= 0.0:
+                # Model is flat along this axis; no factor can change it.
+                factors[axis] = 1.0
+            else:
+                factors[axis] = targets[axis] / extent
+        self._export_scaled(factors)
+
+    def _export_scaled(self, factors):
         source = self._loaded_path
         target = source.with_name(source.stem + "_SCALED" + source.suffix)
         self.statusBar().showMessage(f"Scaling {source.name}…")

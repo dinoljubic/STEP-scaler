@@ -15,10 +15,14 @@ python main.py
 2. The model appears in the preview in a fixed isometric "home" view
    (between top, front and right). The XYZ axes gizmo (X red, Y green,
    Z blue) is always shown in the bottom-left corner.
-3. The X/Y/Z scale boxes and the **Scale** button become enabled
-   (default value 1). Enter scale factors and press **Scale**.
-4. A file named `<original>_SCALED.step` is written next to the original,
-   scaled about the global origin by the entered factors.
+3. The scale controls become enabled, in two rows:
+   - **Size (mm)** boxes, prefilled with the model's bounding-box
+     dimensions. Type target dimensions and press **Scale to size** to
+     scale the model to those dimensions without computing factors.
+   - **Factor** boxes (default 1). Enter relative scale factors and press
+     **Scale**.
+4. Either button writes `<original>_SCALED.step` next to the original,
+   scaled about the global origin.
 
 ## How it works
 
