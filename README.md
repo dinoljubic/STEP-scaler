@@ -37,6 +37,12 @@ python main.py
   intact; non-uniform scales use `gp_GTrsf`/`BRepBuilderAPI_GTransform`,
   which converts affected surfaces to B-splines (unavoidable — e.g. a
   non-uniformly scaled cylinder is no longer a cylinder).
+- Colors survive scaling: the file is read into an XCAF document
+  (`STEPCAFControl`), color styles are collected per subshape, and after
+  the transform they are re-applied to the matching scaled subshapes via
+  the transform's modification history. The preview shows the same colors,
+  taken from the GLB materials. Assembly structure and part names are not
+  preserved (the output is a flat compound).
 
 ## Tests
 

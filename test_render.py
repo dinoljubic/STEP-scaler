@@ -13,12 +13,12 @@ STEP = sys.argv[1]
 OUT = sys.argv[2]
 
 app = QApplication([])
-tris = app_module.load_step_triangles(STEP)
-print(f"triangles: {len(tris):,}")
+tris, colors = app_module.load_step_triangles(STEP)
+print(f"triangles: {len(tris):,} (colors: {colors is not None})")
 
 preview = app_module.PreviewWidget()
 preview.resize(640, 480)
-preview.set_triangles(tris)
+preview.set_triangles(tris, colors)
 pixmap = preview._render_model()
 
 painter_widget = preview  # also draw the gizmo onto the pixmap for inspection

@@ -48,8 +48,31 @@ _UP = np.cross(_VIEW, _RIGHT)                        # screen up
 _LIGHT = np.array([0.5, -1.0, 1.5])
 _LIGHT = _LIGHT / np.linalg.norm(_LIGHT)
 
+def _geometry_face_colors(geom):
+    """Per-face RGB colors in 0..1 for one geometry, or None."""
+    visual = geom.visual
+    material = getattr(visual, "material", None)
+    if material is not None:
+        try:
+            color = np.asarray(material.main_color, dtype=np.float64)[:3]
+            return np.tile(color / 255.0, (len(geom.faces), 1))
+        except Exception:
+            pass
+    try:
+        face_colors = np.asarray(visual.face_colors, dtype=np.float64)
+        if face_colors.ndim == 2 and len(face_colors) == len(geom.faces):
+            return face_colors[:, :3] / 255.0
+    except Exception:
+        pass
+    return None
+
+
 def load_step_triangles(path):
-    """Convert a STEP file to a mesh and return its triangles as (n, 3, 3)."""
+    """Convert a STEP file to a mesh.
+
+    Returns (triangles, colors): triangles as (n, 3, 3) in mm, colors as
+    (n, 3) RGB in 0..1 or None if the file defines no colors.
+    """
     fd, glb_path = tempfile.mkstemp(suffix=".glb")
     os.close(fd)
     try:
@@ -61,20 +84,39 @@ def load_step_triangles(path):
         except OSError:
             pass
 
+    # Walk the scene nodes ourselves: trimesh's merged-scene visuals don't
+    # reliably expose colors, but per-geometry materials do.
     if isinstance(loaded, trimesh.Scene):
-        try:
-            mesh = loaded.to_mesh()
-        except AttributeError:
-            mesh = loaded.dump(concatenate=True)
+        instances = []
+        for node in loaded.graph.nodes_geometry:
+            transform, geom_name = loaded.graph[node]
+            instances.append((np.asarray(transform, dtype=np.float64),
+                              loaded.geometry[geom_name]))
     else:
-        mesh = loaded
+        instances = [(np.eye(4), loaded)]
 
+    default = np.array([160.0, 175.0, 200.0]) / 255.0  # PreviewWidget.BODY
+    triangle_parts, color_parts, any_colors = [], [], False
+    for transform, geom in instances:
+        tris = np.asarray(geom.triangles, dtype=np.float64)
+        if tris.size == 0:
+            continue
+        points = tris.reshape(-1, 3) @ transform[:3, :3].T + transform[:3, 3]
+        triangle_parts.append(points.reshape(-1, 3, 3))
+        colors = _geometry_face_colors(geom)
+        if colors is None:
+            colors = np.tile(default, (len(tris), 1))
+        else:
+            any_colors = True
+        color_parts.append(colors)
+
+    if not triangle_parts:
+        raise ValueError("No geometry found in file.")
     # cascadio keeps the STEP axes (no glTF Y-up conversion) but converts
     # units to meters; scale back to millimetres, the STEP working unit.
-    triangles = np.asarray(mesh.triangles, dtype=np.float64) * 1000.0
-    if triangles.size == 0:
-        raise ValueError("No geometry found in file.")
-    return triangles
+    triangles = np.concatenate(triangle_parts) * 1000.0
+    colors = np.concatenate(color_parts) if any_colors else None
+    return triangles, colors
 
 
 def scale_step_file(source, target, sx, sy, sz):
@@ -83,43 +125,101 @@ def scale_step_file(source, target, sx, sy, sz):
     A uniform scale uses gp_Trsf, which keeps analytic surfaces (planes,
     cylinders, ...) intact. A non-uniform scale requires gp_GTrsf, which
     converts affected surfaces to B-splines.
+
+    Reading and writing goes through XCAF documents so that color
+    assignments survive: styles are collected per subshape before the
+    transform and re-applied to the matching scaled subshapes using the
+    transform's modification history.
     """
     # OCP is heavy to import, so only pull it in when scaling is requested.
+    from OCP.BRep import BRep_Builder
     from OCP.BRepBuilderAPI import (
         BRepBuilderAPI_GTransform,
         BRepBuilderAPI_Transform,
     )
     from OCP.gp import gp_GTrsf, gp_Mat, gp_Pnt, gp_Trsf
     from OCP.IFSelect import IFSelect_RetDone
-    from OCP.STEPControl import (
-        STEPControl_AsIs,
-        STEPControl_Reader,
-        STEPControl_Writer,
+    from OCP.STEPCAFControl import STEPCAFControl_Reader, STEPCAFControl_Writer
+    from OCP.STEPControl import STEPControl_AsIs
+    from OCP.TCollection import TCollection_ExtendedString
+    from OCP.TDF import TDF_LabelSequence
+    from OCP.TDocStd import TDocStd_Document
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.XCAFDoc import (
+        XCAFDoc_ColorCurv,
+        XCAFDoc_ColorSurf,
+        XCAFDoc_DocumentTool,
     )
+    from OCP.XCAFPrs import XCAFPrs, XCAFPrs_IndexedDataMapOfShapeStyle
 
-    reader = STEPControl_Reader()
+    reader = STEPCAFControl_Reader()
+    reader.SetColorMode(True)
+    reader.SetNameMode(True)
     if reader.ReadFile(str(source)) != IFSelect_RetDone:
         raise ValueError(f"Could not read STEP file: {source}")
-    reader.TransferRoots()
-    shape = reader.OneShape()
-    if shape.IsNull():
+    src_doc = TDocStd_Document(TCollection_ExtendedString("XmlXCAF"))
+    if not reader.Transfer(src_doc):
+        raise ValueError(f"Could not transfer STEP data: {source}")
+    src_shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(src_doc.Main())
+
+    roots = TDF_LabelSequence()
+    src_shape_tool.GetFreeShapes(roots)
+    if roots.Length() == 0:
         raise ValueError("No shape found in STEP file.")
+
+    # Flatten all root shapes into one compound and record every style
+    # (color) assignment, keyed by the located subshape it applies to.
+    compound = TopoDS_Compound()
+    BRep_Builder().MakeCompound(compound)
+    styles = XCAFPrs_IndexedDataMapOfShapeStyle()
+    for i in range(1, roots.Length() + 1):
+        label = roots.Value(i)
+        BRep_Builder().Add(compound, src_shape_tool.GetShape_s(label))
+        XCAFPrs.CollectStyleSettings_s(label, TopLoc_Location(), styles)
 
     if sx == sy == sz:
         trsf = gp_Trsf()
         trsf.SetScale(gp_Pnt(0.0, 0.0, 0.0), sx)
-        builder = BRepBuilderAPI_Transform(shape, trsf, True)
+        builder = BRepBuilderAPI_Transform(compound, trsf, True)
     else:
         gtrsf = gp_GTrsf()
         gtrsf.SetVectorialPart(gp_Mat(sx, 0.0, 0.0,
                                       0.0, sy, 0.0,
                                       0.0, 0.0, sz))
-        builder = BRepBuilderAPI_GTransform(shape, gtrsf, True)
+        builder = BRepBuilderAPI_GTransform(compound, gtrsf, True)
     if not builder.IsDone():
         raise ValueError("Scaling transform failed.")
 
-    writer = STEPControl_Writer()
-    writer.Transfer(builder.Shape(), STEPControl_AsIs)
+    # New document: the scaled compound plus the remapped colors.
+    out_doc = TDocStd_Document(TCollection_ExtendedString("XmlXCAF"))
+    out_shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(out_doc.Main())
+    out_color_tool = XCAFDoc_DocumentTool.ColorTool_s(out_doc.Main())
+    root_label = out_shape_tool.AddShape(builder.Shape(), False)
+
+    for i in range(1, styles.Extent() + 1):
+        old_shape = styles.FindKey(i)
+        style = styles.FindFromIndex(i)
+        try:
+            new_shape = builder.ModifiedShape(old_shape)
+        except RuntimeError:
+            continue
+        if new_shape.IsNull():
+            continue
+        sub_label = out_shape_tool.AddSubShape(root_label, new_shape)
+        if sub_label.IsNull():
+            continue
+        if style.IsSetColorSurf():
+            out_color_tool.SetColor(sub_label, style.GetColorSurfRGBA(),
+                                    XCAFDoc_ColorSurf)
+        if style.IsSetColorCurv():
+            out_color_tool.SetColor(sub_label, style.GetColorCurv(),
+                                    XCAFDoc_ColorCurv)
+
+    writer = STEPCAFControl_Writer()
+    writer.SetColorMode(True)
+    writer.SetNameMode(True)
+    writer.Transfer(out_doc, STEPControl_AsIs)
     if writer.Write(str(target)) != IFSelect_RetDone:
         raise ValueError(f"Could not write STEP file: {target}")
 
@@ -135,10 +235,12 @@ class PreviewWidget(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         self.setMinimumSize(480, 380)
         self._triangles = None
+        self._colors = None
         self._pixmap = None
 
-    def set_triangles(self, triangles):
+    def set_triangles(self, triangles, colors=None):
         self._triangles = triangles
+        self._colors = colors
         self._pixmap = None
         self.update()
 
@@ -194,8 +296,12 @@ class PreviewWidget(QFrame):
         normals /= lengths[:, None]
         shade = 0.25 + 0.75 * np.clip(np.abs(normals @ _LIGHT), 0.0, 1.0)
 
-        base = np.array([self.BODY.red(), self.BODY.green(), self.BODY.blue()])
-        colors = (base[None, :] * shade[:, None]).astype(np.uint8)
+        if self._colors is not None:
+            base = self._colors * 255.0
+        else:
+            base = np.full((1, 3), 0.0) + np.array(
+                [self.BODY.red(), self.BODY.green(), self.BODY.blue()])
+        colors = np.clip(base * shade[:, None], 0.0, 255.0).astype(np.uint8)
 
         # Painter's algorithm: far triangles first.
         order = np.argsort(depth)
@@ -324,7 +430,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            triangles = load_step_triangles(path)
+            triangles, colors = load_step_triangles(path)
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             self.statusBar().showMessage("Load failed.")
@@ -334,7 +440,7 @@ class MainWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
 
         self._loaded_path = Path(path)
-        self.preview.set_triangles(triangles)
+        self.preview.set_triangles(triangles, colors)
         points = triangles.reshape(-1, 3)
         self._extents = points.max(axis=0) - points.min(axis=0)
         for edit in self.scale_edits.values():
