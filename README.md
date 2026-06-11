@@ -17,21 +17,22 @@ python main.py
    Z blue) is always shown in the bottom-left corner.
 3. The X/Y/Z scale boxes and the **Scale** button become enabled
    (default value 1). Enter scale factors and press **Scale**.
-4. A file named `<original>_SCALED.step` is written next to the original.
-
-> **Note:** scaling is not implemented yet — the export is currently an
-> unmodified copy of the loaded file. The entered factors are validated
-> and reported in the status bar, ready to be wired up to real geometry
-> scaling later (see the `TODO` in `MainWindow._on_scale_clicked`).
+4. A file named `<original>_SCALED.step` is written next to the original,
+   scaled about the global origin by the entered factors.
 
 ## How it works
 
-- `cascadio` (OpenCASCADE) converts the STEP file to a temporary GLB mesh.
-- `trimesh` loads the mesh; triangles are rotated from glTF Y-up back to
-  STEP Z-up.
+- `cascadio` (OpenCASCADE) converts the STEP file to a temporary GLB mesh
+  for the preview; `trimesh` loads it. Vertices keep the original STEP
+  coordinates.
 - The preview is rendered with QPainter: orthographic projection from the
   (+X, −Y, +Z) octant, flat shading, painter's-algorithm depth sort. It is
   intentionally non-interactive.
+- Scaling is done on the real B-rep geometry via OpenCASCADE
+  (`cadquery-ocp`): uniform scales use `gp_Trsf` and keep analytic surfaces
+  intact; non-uniform scales use `gp_GTrsf`/`BRepBuilderAPI_GTransform`,
+  which converts affected surfaces to B-splines (unavoidable — e.g. a
+  non-uniformly scaled cylinder is no longer a cylinder).
 
 ## Tests
 

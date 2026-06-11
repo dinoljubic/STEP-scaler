@@ -1,11 +1,10 @@
 """STEP Scaler — load a .step file, preview it, and export a scaled copy.
 
-Scaling itself is not implemented yet: the Scale button currently exports an
-unmodified copy of the loaded file with a "_SCALED" suffix.
+The Scale button scales the B-rep geometry about the global origin and
+exports it with a "_SCALED" suffix.
 """
 
 import os
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -49,10 +48,6 @@ _UP = np.cross(_VIEW, _RIGHT)                        # screen up
 _LIGHT = np.array([0.5, -1.0, 1.5])
 _LIGHT = _LIGHT / np.linalg.norm(_LIGHT)
 
-# glTF (what cascadio produces) is Y-up; rotate back to the STEP Z-up frame.
-_YUP_TO_ZUP = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
-
-
 def load_step_triangles(path):
     """Convert a STEP file to a mesh and return its triangles as (n, 3, 3)."""
     fd, glb_path = tempfile.mkstemp(suffix=".glb")
@@ -74,10 +69,59 @@ def load_step_triangles(path):
     else:
         mesh = loaded
 
+    # cascadio writes GLB vertices in the original STEP coordinates (no
+    # glTF Y-up conversion), so the triangles can be used as-is.
     triangles = np.asarray(mesh.triangles, dtype=np.float64)
     if triangles.size == 0:
         raise ValueError("No geometry found in file.")
-    return triangles @ _YUP_TO_ZUP.T
+    return triangles
+
+
+def scale_step_file(source, target, sx, sy, sz):
+    """Read a STEP file, scale it about the global origin, write it back.
+
+    A uniform scale uses gp_Trsf, which keeps analytic surfaces (planes,
+    cylinders, ...) intact. A non-uniform scale requires gp_GTrsf, which
+    converts affected surfaces to B-splines.
+    """
+    # OCP is heavy to import, so only pull it in when scaling is requested.
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_GTransform,
+        BRepBuilderAPI_Transform,
+    )
+    from OCP.gp import gp_GTrsf, gp_Mat, gp_Pnt, gp_Trsf
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.STEPControl import (
+        STEPControl_AsIs,
+        STEPControl_Reader,
+        STEPControl_Writer,
+    )
+
+    reader = STEPControl_Reader()
+    if reader.ReadFile(str(source)) != IFSelect_RetDone:
+        raise ValueError(f"Could not read STEP file: {source}")
+    reader.TransferRoots()
+    shape = reader.OneShape()
+    if shape.IsNull():
+        raise ValueError("No shape found in STEP file.")
+
+    if sx == sy == sz:
+        trsf = gp_Trsf()
+        trsf.SetScale(gp_Pnt(0.0, 0.0, 0.0), sx)
+        builder = BRepBuilderAPI_Transform(shape, trsf, True)
+    else:
+        gtrsf = gp_GTrsf()
+        gtrsf.SetVectorialPart(gp_Mat(sx, 0.0, 0.0,
+                                      0.0, sy, 0.0,
+                                      0.0, 0.0, sz))
+        builder = BRepBuilderAPI_GTransform(shape, gtrsf, True)
+    if not builder.IsDone():
+        raise ValueError("Scaling transform failed.")
+
+    writer = STEPControl_Writer()
+    writer.Transfer(builder.Shape(), STEPControl_AsIs)
+    if writer.Write(str(target)) != IFSelect_RetDone:
+        raise ValueError(f"Could not write STEP file: {target}")
 
 
 class PreviewWidget(QFrame):
@@ -296,16 +340,21 @@ class MainWindow(QMainWindow):
 
         source = self._loaded_path
         target = source.with_name(source.stem + "_SCALED" + source.suffix)
+        self.statusBar().showMessage(f"Scaling {source.name}…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
         try:
-            # TODO: apply factors (X/Y/Z) to the geometry. For now the file
-            # is exported unmodified.
-            shutil.copyfile(source, target)
-        except OSError as exc:
+            scale_step_file(source, target,
+                            factors["X"], factors["Y"], factors["Z"])
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage("Export failed.")
             QMessageBox.critical(self, "Export failed", str(exc))
             return
+        QApplication.restoreOverrideCursor()
         self.statusBar().showMessage(
             f"Exported {target.name} (scale X={factors['X']:g} "
-            f"Y={factors['Y']:g} Z={factors['Z']:g} — not yet applied).")
+            f"Y={factors['Y']:g} Z={factors['Z']:g}).")
 
 
 def main():

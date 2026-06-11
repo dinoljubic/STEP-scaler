@@ -1,4 +1,5 @@
 PySide6
 trimesh
 cascadio
+cadquery-ocp
 numpy
