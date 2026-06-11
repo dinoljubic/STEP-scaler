@@ -1,6 +1,7 @@
 # STEP Scaler
 
 Small desktop tool for scaling 3D models in STEP format.
+Built with Claude Code
 
 ## Run
 
